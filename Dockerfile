@@ -1,47 +1,53 @@
-# Build Stage: using Go 1.24.1 image
+# syntax=docker/dockerfile:1.4              # enable BuildKit features
+#### Stage 1: build ####
 FROM quay.io/projectquay/golang:1.24 AS builder
+
 ARG TARGETOS
 ARG TARGETARCH
-
-# Install build tools
-RUN dnf install -y gcc-c++ libstdc++ libstdc++-devel clang && dnf clean all
-
 WORKDIR /workspace
 
-# Copy the Go Modules manifests
-COPY go.mod go.mod
-COPY go.sum go.sum
+# 1. Install C/C++ toolchain (cached unless this line changes)
+RUN --mount=type=cache,target=/var/cache/dnf \
+    dnf install -y gcc-c++ libstdc++ libstdc++-devel clang && \
+    dnf clean all
 
-# Copy the go source
-COPY cmd/ cmd/
-COPY pkg/ pkg/
+# 2. Download and index HuggingFace tokenizer library (cached by args)
+RUN mkdir lib && \
+    curl -fsSL \
+      https://github.com/daulet/tokenizers/releases/download/v1.20.2/\
+libtokenizers.${TARGETOS}-${TARGETARCH}.tar.gz | tar -xz -C lib && \
+    ranlib lib/*.a
+
+# 3. Cache Go modules
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# 4. Copy application source
+COPY cmd/    cmd/
+COPY pkg/    pkg/
 COPY internal/ internal/
 
-# HuggingFace tokenizer bindings
-RUN mkdir -p lib
-RUN curl -L https://github.com/daulet/tokenizers/releases/download/v1.20.2/libtokenizers.${TARGETOS}-${TARGETARCH}.tar.gz | tar -xz -C lib
-RUN ranlib lib/*.a
+# 5. Build the binary
+ENV CGO_ENABLED=1 \
+    GOOS=${TARGETOS:-linux} \
+    GOARCH=${TARGETARCH}
+RUN go build \
+    -o bin/epp \
+    -ldflags="-extldflags '-L$(pwd)/lib'" \
+    cmd/epp/main.go cmd/epp/health.go
 
-# Build
-# the GOARCH has not a default value to allow the binary be built according to the host where the command
-# was called. For example, if we call make image-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-ENV CGO_ENABLED=1
-ENV GOOS=${TARGETOS:-linux}
-ENV GOARCH=${TARGETARCH}
-RUN go build -a -o bin/epp -ldflags="-extldflags '-L$(pwd)/lib'" cmd/epp/main.go cmd/epp/health.go
-
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
+#### Stage 2: runtime ####
 FROM registry.access.redhat.com/ubi9/ubi:latest
 WORKDIR /
+
+# only the compiled binary
 COPY --from=builder /workspace/bin/epp /app/epp
+
+# non-root user
 USER 65532:65532
 
-# expose gRPC, health and metrics ports
-EXPOSE 9002
-EXPOSE 9003
-EXPOSE 9090
+# expose ports
+EXPOSE 9002 9003 9090
 
 ENTRYPOINT ["/app/epp"]
